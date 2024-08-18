@@ -84,7 +84,9 @@ class KernelPDBScanner(interfaces.automagic.AutomagicInterface):
             )
             if layer_name and virtual_layer_name:
                 memlayer = context.layers[virtual_layer_name]
-                if isinstance(memlayer, intel.Intel):
+                if isinstance(memlayer, intel.Intel) or isinstance(
+                    memlayer, layers.arm.AArch64
+                ):
                     results = [virtual_layer_name]
         else:
             for subreq in requirement.requirements.values():
@@ -254,7 +256,8 @@ class KernelPDBScanner(interfaces.automagic.AutomagicInterface):
         if (
             optimized
             and not physical
-            and context.layers[layer_to_scan].metadata.architecture in ["Intel64"]
+            and context.layers[layer_to_scan].metadata.architecture
+            in ["Intel64", "AArch64"]
         ):
             # TODO: change this value accordingly when 5-Level paging is supported.
             start_scan_address = 0x1F0 << 39
@@ -409,7 +412,9 @@ class KernelPDBScanner(interfaces.automagic.AutomagicInterface):
         valid_kernel: Optional[ValidKernelType] = None
         for virtual_layer_name in potential_layers:
             vlayer = context.layers.get(virtual_layer_name, None)
-            if isinstance(vlayer, layers.intel.Intel):
+            if isinstance(vlayer, layers.intel.Intel) or isinstance(
+                vlayer, layers.arm.AArch64
+            ):
                 for method in self.methods:
                     valid_kernel = method(self, context, vlayer, progress_callback)
                     if valid_kernel:

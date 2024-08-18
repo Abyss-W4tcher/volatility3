@@ -28,11 +28,13 @@ The self-referential indices for older versions of windows are listed below:
 """
 import logging
 import struct
+import json
 from typing import Generator, Iterable, List, Optional, Tuple, Type
 
-from volatility3.framework import constants, interfaces, layers
+from volatility3.framework import constants, interfaces
 from volatility3.framework.configuration import requirements
-from volatility3.framework.layers import intel
+from volatility3.framework.layers import intel, arm
+from volatility3.framework.interfaces.configuration import path_join
 
 vollog = logging.getLogger(__name__)
 
@@ -43,7 +45,7 @@ class DtbSelfReferential:
 
     def __init__(
         self,
-        layer_type: Type[layers.intel.Intel],
+        layer_type: Type[intel.Intel],
         ptr_struct: str,
         mask: int,
         valid_range: Iterable[int],
@@ -90,7 +92,7 @@ class DtbSelfReferential:
 class DtbSelfRef32bit(DtbSelfReferential):
     def __init__(self):
         super().__init__(
-            layer_type=layers.intel.WindowsIntel,
+            layer_type=intel.WindowsIntel,
             ptr_struct="I",
             mask=0xFFFFF000,
             valid_range=[0x300],
@@ -101,7 +103,7 @@ class DtbSelfRef32bit(DtbSelfReferential):
 class DtbSelfRef64bit(DtbSelfReferential):
     def __init__(self) -> None:
         super().__init__(
-            layer_type=layers.intel.WindowsIntel32e,
+            layer_type=intel.WindowsIntel32e,
             ptr_struct="Q",
             mask=0x3FFFFFFFFFF000,
             valid_range=range(0x100, 0x1FF),
@@ -112,7 +114,7 @@ class DtbSelfRef64bit(DtbSelfReferential):
 class DtbSelfRef64bitOldWindows(DtbSelfReferential):
     def __init__(self) -> None:
         super().__init__(
-            layer_type=layers.intel.WindowsIntel32e,
+            layer_type=intel.WindowsIntel32e,
             ptr_struct="Q",
             mask=0x3FFFFFFFFFF000,
             valid_range=[0x1ED],
@@ -123,7 +125,7 @@ class DtbSelfRef64bitOldWindows(DtbSelfReferential):
 class DtbSelfRefPae(DtbSelfReferential):
     def __init__(self) -> None:
         super().__init__(
-            layer_type=layers.intel.WindowsIntelPAE,
+            layer_type=intel.WindowsIntelPAE,
             ptr_struct="Q",
             valid_range=[0x3],
             mask=0x3FFFFFFFFFF000,
@@ -145,7 +147,9 @@ class DtbSelfRefPae(DtbSelfReferential):
             # Build what we expect the page table to be
             expected_table = b"".join(
                 [
-                    struct.pack(self.ptr_struct, top_pae_page + (i * 0x1000))
+                    struct.pack(
+                        self.ptr_struct, top_pae_page + (i * self.layer_type.page_size)
+                    )
                     for i in range(1, 5)
                 ]
             )
@@ -164,6 +168,22 @@ class DtbSelfRefPae(DtbSelfReferential):
             # Return None since the dtb value *isn't* None
             return None
         return dtb
+
+
+class DtbSelfRef64bitAArch64(DtbSelfReferential):
+    def __init__(self) -> None:
+        """
+        DTB was observed to be masked out with 0x60000000000000 (MiFillSystemPtes references ?),
+        but some pointers are also given upper bits masking on physical addresses.
+        HalpInterruptBuildGlobalStartupStub() kernel function allocates 0x28 bytes for the DTB.
+        """
+        super().__init__(
+            layer_type=arm.WindowsAArch64,
+            ptr_struct="Q",
+            mask=(1 << 0x28) - 1 ^ arm.WindowsAArch64.page_mask,
+            valid_range=range(0x100, 0x300),
+            reserved_bits=0x0,
+        )
 
 
 class PageMapScanner(interfaces.layers.ScannerInterface):
@@ -196,6 +216,17 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
 
     # Group these by region so we only run over the data once
     test_sets = [
+        # FIXME: Trying each architecture might take some (unnecessary) time ?
+        # FIXME: AArch64 was set on top, to speed-up tests
+        (
+            "Detecting Self-referential pointer for AArch64 windows",
+            [DtbSelfRef64bitAArch64()],
+            # This offset was found by observations between memory samples :
+            # 0x800a9000, 0x80d45000, 0x80342800, 0x802a9800
+            # It is also referenced in the Windows kernel.
+            # TODO: size is arbitrary for now
+            [(0x80000000, 0xF00000)],
+        ),
         (
             "Detecting Self-referential pointer for recent windows",
             [DtbSelfRef64bit()],
@@ -228,7 +259,7 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
         itself more than once).
         """
         base_layer = context.layers[layer_name]
-        if isinstance(base_layer, intel.Intel):
+        if isinstance(base_layer, intel.Intel) or isinstance(base_layer, arm.AArch64):
             return None
         if base_layer.metadata.get("os", None) not in ["Windows", "Unknown"]:
             return None
@@ -274,11 +305,13 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
         for description, tests, sections in cls.test_sets:
             vollog.debug(description)
             # There is a very high chance that the DTB will live in these very narrow segments, assuming we couldn't find them previously
-            hits = base_layer.scan(
-                context,
-                PageMapScanner(tests=tests),
-                sections=sections,
-                progress_callback=progress_callback,
+            hits: Generator[Tuple[DtbSelfReferential, int], None, None] = (
+                base_layer.scan(
+                    context,
+                    PageMapScanner(tests=tests),
+                    sections=sections,
+                    progress_callback=progress_callback,
+                )
             )
 
             # Flatten the generator
@@ -286,19 +319,22 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
                 """Key used to sort by tests"""
                 return tests.index(x[0]), x[1]
 
-            def get_max_pointer(page_table, test, ptr_size: int):
+            def get_max_pointer(page_table, test: DtbSelfReferential, ptr_size: int):
                 """Determines a pointer from a page_table"""
                 max_ptr = 0
                 for index in range(0, len(page_table), ptr_size):
                     pointer = struct.unpack(
                         test.ptr_struct, page_table[index : index + ptr_size]
                     )[0]
+                    # Mask out unnecessary (upper) bits, as done in DtbSelfReferential
+                    # FIXME: prefer test.layer_type.page_mask, but attribute seems broken in Intel layer ("~" ?)
+                    pointer &= test.mask ^ (test.layer_type.page_size - 1)
                     # Make sure the pointer is valid, ignore large pages which would require more calculation
-                    if pointer & 0x1 and not pointer & 0x80:
+                    if pointer & 0x1 and not pointer & test.reserved_bits:
                         max_ptr = max(
                             max_ptr,
                             (pointer ^ (pointer & 0xFFF))
-                            % test.layer_type.maximum_address,
+                            % ((1 << test.layer_type._maxvirtaddr) - 1),
                         )
                 return max_ptr
 
@@ -306,7 +342,7 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
 
             for test, page_map_offset in hits:
                 # Turn the page tables into integers and find the largest one
-                page_table = base_layer.read(page_map_offset, 0x1000)
+                page_table = base_layer.read(page_map_offset, test.layer_type.page_size)
                 ptr_size = struct.calcsize(test.ptr_struct)
                 max_pointer = get_max_pointer(page_table, test, ptr_size)
 
@@ -314,24 +350,91 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
                     vollog.debug(
                         f"{test.__class__.__name__} test succeeded at {hex(page_map_offset)}"
                     )
-                    new_layer_name = context.layers.free_layer_name("IntelLayer")
-                    config_path = interfaces.configuration.path_join(
-                        "IntelHelper", new_layer_name
-                    )
-                    context.config[
-                        interfaces.configuration.path_join(config_path, "memory_layer")
-                    ] = layer_name
-                    context.config[
-                        interfaces.configuration.path_join(
-                            config_path, "page_map_offset"
+                    if issubclass(test.layer_type, intel.Intel):
+                        new_layer_name = context.layers.free_layer_name("IntelLayer")
+                        config_path = interfaces.configuration.path_join(
+                            "IntelHelper", new_layer_name
                         )
-                    ] = page_map_offset
-                    layer = test.layer_type(
-                        context,
-                        config_path=config_path,
-                        name=new_layer_name,
-                        metadata={"os": "Windows"},
-                    )
+                        context.config[
+                            interfaces.configuration.path_join(
+                                config_path, "memory_layer"
+                            )
+                        ] = layer_name
+                        context.config[
+                            interfaces.configuration.path_join(
+                                config_path, "page_map_offset"
+                            )
+                        ] = page_map_offset
+                        layer = test.layer_type(
+                            context,
+                            config_path=config_path,
+                            name=new_layer_name,
+                            metadata={"os": "Windows"},
+                        )
+                    elif issubclass(test.layer_type, arm.AArch64):
+                        cpu_registers = {}
+                        # HalpStartupStub() kernel function offsets ttbr1_el1.baddr by 0x800
+                        # from ttbr0_el1.baddr
+                        page_map_offset += 0x800
+                        new_layer_name = context.layers.free_layer_name("AArch64Layer")
+                        config_path = interfaces.configuration.path_join(
+                            "AArch64Helper", new_layer_name
+                        )
+                        context.config[
+                            interfaces.configuration.path_join(
+                                config_path, "memory_layer"
+                            )
+                        ] = layer_name
+                        context.config[
+                            interfaces.configuration.path_join(
+                                config_path, "page_map_offset"
+                            )
+                        ] = page_map_offset
+                        ttbr1_el1 = arm.set_reg_bits(
+                            page_map_offset, arm.AArch64RegMap.TTBR1_EL1.BADDR
+                        )
+                        tcr_el1 = 0
+                        # MmSystemRangeStart = 0xFFFF800000000000 <=> T1SZ = 17
+                        tcr_el1 = arm.set_reg_bits(
+                            17, arm.AArch64RegMap.TCR_EL1.T1SZ, tcr_el1
+                        )
+                        tcr_el1 = arm.set_reg_bits(
+                            17, arm.AArch64RegMap.TCR_EL1.T0SZ, tcr_el1
+                        )
+                        # Page size is hardcoded in Windows kernel (CmSiGetPageSize() kernel function)
+                        tcr_el1_tg1 = (
+                            arm.AArch64RegFieldValues._get_ttbr1_el1_granule_size(
+                                4, True
+                            )
+                        )
+                        tcr_el1_tg0 = (
+                            arm.AArch64RegFieldValues._get_ttbr0_el1_granule_size(
+                                4, True
+                            )
+                        )
+                        tcr_el1 = arm.set_reg_bits(
+                            tcr_el1_tg1, arm.AArch64RegMap.TCR_EL1.TG1, tcr_el1
+                        )
+                        tcr_el1 = arm.set_reg_bits(
+                            tcr_el1_tg0, arm.AArch64RegMap.TCR_EL1.TG0, tcr_el1
+                        )
+
+                        cpu_registers[arm.AArch64RegMap.TCR_EL1.__name__] = tcr_el1
+                        cpu_registers[arm.AArch64RegMap.TTBR1_EL1.__name__] = ttbr1_el1
+                        context.config[path_join(config_path, "cpu_registers")] = (
+                            json.dumps(cpu_registers)
+                        )
+
+                        context.config[path_join(config_path, "kernel_endianness")] = (
+                            "little"
+                        )
+
+                        layer = test.layer_type(
+                            context,
+                            config_path=config_path,
+                            name=new_layer_name,
+                            metadata={"os": "Windows"},
+                        )
                     break
                 else:
                     vollog.debug(
