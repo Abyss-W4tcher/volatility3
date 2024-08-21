@@ -7,6 +7,7 @@ import functools
 import collections
 import json
 import inspect
+import struct
 from typing import Optional, Dict, Any, List, Iterable, Tuple
 from enum import Enum
 
@@ -95,7 +96,7 @@ class AArch64(linear.LinearlyMappedLayer):
             )
         self._cpu_regs_mapped = self._map_reg_values(self._cpu_regs)
 
-        self._kernel_endianness = self.config["kernel_endianness"]
+        self._entry_format = self.config["entry_format"]
         self._layer_debug = self.config.get("layer_debug", False)
         self._translation_debug = self.config.get("translation_debug", False)
         self._base_layer = self.config["memory_layer"]
@@ -153,6 +154,8 @@ class AArch64(linear.LinearlyMappedLayer):
 
         self._page_size = self._ttb_granule * 1024
         self._page_size_in_bits = self._page_size.bit_length() - 1
+        self._entry_size = struct.calcsize(self._entry_format)
+        self._entry_number = self._page_size // self._entry_size
 
         # CPU features
         hafdbs = self._read_register_field(AArch64RegMap.ID_AA64MMFR1_EL1.HAFDBS, True)
@@ -250,11 +253,11 @@ class AArch64(linear.LinearlyMappedLayer):
         max_level = len(self._ttb_lookup_indexes) - 1
         for level, (high_bit, low_bit) in enumerate(self._ttb_lookup_indexes):
             index = self._mask(virtual_offset, high_bit, low_bit)
-            descriptor = int.from_bytes(
+            (descriptor,) = struct.unpack(
+                self._entry_format,
                 base_layer.read(
                     table_address + (index * self._register_size), self._register_size
                 ),
-                byteorder=self._kernel_endianness,
             )
             table_address = 0
             # Bits 51->x need to be extracted from the descriptor
@@ -278,6 +281,13 @@ class AArch64(linear.LinearlyMappedLayer):
                     )
                     << self._ttb_descriptor_bits[1]
                 )
+                if self._get_valid_table(table_address) == None:
+                    raise exceptions.PagedInvalidAddressException(
+                        layer_name=self.name,
+                        invalid_address=virtual_offset,
+                        invalid_bits=low_bit,
+                        entry=descriptor,
+                    )
             # Block descriptor
             elif level < max_level and descriptor_type == 0b01:
                 table_address |= (
@@ -315,6 +325,18 @@ class AArch64(linear.LinearlyMappedLayer):
             )
 
         return table_address, low_bit, descriptor
+
+    @functools.lru_cache(1025)
+    def _get_valid_table(self, base_address: int) -> Optional[bytes]:
+        """Extracts the translation table, validates it and returns it if it's valid."""
+        table = self._context.layers.read(
+            self._base_layer, base_address, self.page_size
+        )
+        # If the table is entirely duplicates, then mark the whole table as bad
+        if table == table[: self._entry_size] * self._entry_number:
+            return None
+
+        return table
 
     def mapping(
         self, offset: int, length: int, ignore_errors: bool = False
@@ -615,11 +637,10 @@ class AArch64(linear.LinearlyMappedLayer):
                 optional=False,
                 description='DTB of the target context (either "kernel space" or "user space process").',
             ),
-            requirements.ChoiceRequirement(
-                choices=["little", "big"],
-                name="kernel_endianness",
+            requirements.StringRequirement(
+                name="entry_format",
                 optional=False,
-                description="Kernel endianness (little or big)",
+                description='Format and byte order of table descriptors, represented in the "struct" format.',
             ),
             requirements.StringRequirement(
                 name="cpu_registers",
