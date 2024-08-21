@@ -425,9 +425,7 @@ class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
                             json.dumps(cpu_registers)
                         )
 
-                        context.config[path_join(config_path, "kernel_endianness")] = (
-                            "little"
-                        )
+                        context.config[path_join(config_path, "entry_format")] = "<Q"
 
                         layer = test.layer_type(
                             context,
