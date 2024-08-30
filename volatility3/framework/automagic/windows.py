@@ -174,14 +174,15 @@ class DtbSelfRef64bitAArch64(DtbSelfReferential):
     def __init__(self) -> None:
         """
         DTB was observed to be masked out with 0x60000000000000 (MiFillSystemPtes references ?),
-        but some pointers are also given upper bits masking on physical addresses.
+        but some pointers were also given upper bits masking on physical addresses.
         HalpInterruptBuildGlobalStartupStub() kernel function allocates 0x28 bytes for the DTB.
+        See kernel function MiRebaseDynamicRelocationRegions() for valid_range (self-referential pml4 randomization).
         """
         super().__init__(
             layer_type=arm.WindowsAArch64,
             ptr_struct="Q",
             mask=(1 << 0x28) - 1 ^ arm.WindowsAArch64.page_mask,
-            valid_range=range(0x100, 0x300),
+            valid_range=range(0x100, 0x1FF),
             reserved_bits=0x0,
         )
 
@@ -210,21 +211,17 @@ class PageMapScanner(interfaces.layers.ScannerInterface):
                     yield (test, result[0])
 
 
-class WindowsIntelStacker(interfaces.automagic.StackerLayerInterface):
+class WindowsStacker(interfaces.automagic.StackerLayerInterface):
     stack_order = 40
     exclusion_list = ["mac", "linux"]
 
     # Group these by region so we only run over the data once
     test_sets = [
-        # FIXME: Trying each architecture might take some (unnecessary) time ?
-        # FIXME: AArch64 was set on top, to speed-up tests
         (
             "Detecting Self-referential pointer for AArch64 windows",
             [DtbSelfRef64bitAArch64()],
             # This offset was found by observations between memory samples :
             # 0x800a9000, 0x80d45000, 0x80342800, 0x802a9800
-            # It is also referenced in the Windows kernel.
-            # TODO: size is arbitrary for now
             [(0x80000000, 0xF00000)],
         ),
         (
