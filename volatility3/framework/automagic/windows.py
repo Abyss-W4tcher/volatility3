@@ -226,9 +226,9 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
         (
             "Detecting Self-referential pointer for AArch64 windows",
             [DtbSelfRef64bitAArch64()],
-            # This offset was found by observations between memory samples :
-            # 0x800a9000, 0x80d45000, 0x80342800, 0x802a9800
-            [(0x80000000, 0xF00000)],
+            # The ranges were estimated based on sample values :
+            # 0x800a9000, 0x80d45000, 0x80342800, 0x802a9800, 0x8ef000
+            [(0x80000000, 0xF00000), (0x30000, 0x1000000)],
         ),
         (
             "Detecting Self-referential pointer for recent windows",
