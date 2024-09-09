@@ -173,14 +173,15 @@ class DtbSelfRefPae(DtbSelfReferential):
 class DtbSelfRef64bitAArch64(DtbSelfReferential):
     def __init__(self) -> None:
         """
-        DTB was observed to be masked out with 0x60000000000000 (MiFillSystemPtes references ?),
-        but some pointers were also given upper bits masking on physical addresses.
+        Pointers inside the DTB page are masked out with upper descriptor bits,
+        hence requiring a careful masking to extract the address.
+        Observation confirms it, code justification might be in HalpCommitTiledPageTableWorker().
         HalpInterruptBuildGlobalStartupStub() kernel function allocates 0x28 bytes for the DTB.
-        See kernel function MiRebaseDynamicRelocationRegions() for valid_range (self-referential pml4 randomization).
         """
         super().__init__(
             layer_type=arm.WindowsAArch64,
             ptr_struct="Q",
+            # Basically 0xfffffff000
             mask=(1 << 0x28) - 1 ^ arm.WindowsAArch64.page_mask,
             valid_range=range(0x100, 0x1FF),
             reserved_bits=0x0,
@@ -193,7 +194,12 @@ class PageMapScanner(interfaces.layers.ScannerInterface):
 
     overlap = 0x4000
     thread_safe = True
-    tests = [DtbSelfRef64bit(), DtbSelfRefPae(), DtbSelfRef32bit()]
+    tests = [
+        DtbSelfRef64bitAArch64(),
+        DtbSelfRef64bit(),
+        DtbSelfRefPae(),
+        DtbSelfRef32bit(),
+    ]
     """The default tests to run when searching for DTBs"""
 
     def __init__(self, tests: Optional[List[DtbSelfReferential]]) -> None:
@@ -327,7 +333,8 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
                     # FIXME: prefer test.layer_type.page_mask, but attribute seems broken in Intel layer ("~" ?)
                     pointer &= test.mask ^ (test.layer_type.page_size - 1)
                     # Make sure the pointer is valid, ignore large pages which would require more calculation
-                    if pointer & 0x1 and not pointer & test.reserved_bits:
+                    # FIXME: Find documentation for 0x80, and check AArch64 validity for this value
+                    if pointer & 0x1 and not pointer & 0x80:
                         max_ptr = max(
                             max_ptr,
                             (pointer ^ (pointer & 0xFFF))
@@ -370,8 +377,8 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
                         )
                     elif issubclass(test.layer_type, arm.AArch64):
                         cpu_registers = {}
-                        # HalpStartupStub() kernel function offsets ttbr1_el1.baddr by 0x800
-                        # from ttbr0_el1.baddr
+                        # TTBR1_EL1.BADDR = TTBR0_EL1.BADDR + 0x800
+                        # See HalpStartupStub() kernel function for reference.
                         page_map_offset += 0x800
                         new_layer_name = context.layers.free_layer_name("AArch64Layer")
                         config_path = interfaces.configuration.path_join(
@@ -398,7 +405,8 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
                         tcr_el1 = arm.set_reg_bits(
                             17, arm.AArch64RegMap.TCR_EL1.T0SZ, tcr_el1
                         )
-                        # Page size is hardcoded in Windows kernel (CmSiGetPageSize() kernel function)
+                        # Page size is hardcoded in Windows kernel
+                        # See CmSiGetPageSize() kernel function
                         tcr_el1_tg1 = (
                             arm.AArch64RegFieldValues._get_ttbr1_el1_granule_size(
                                 4, True
