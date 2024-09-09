@@ -424,12 +424,12 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
                             tcr_el1_tg0, arm.AArch64RegMap.TCR_EL1.TG0, tcr_el1
                         )
 
-                        cpu_registers[arm.AArch64RegMap.TCR_EL1.__name__] = tcr_el1
-                        cpu_registers[arm.AArch64RegMap.TTBR1_EL1.__name__] = ttbr1_el1
-                        context.config[path_join(config_path, "cpu_registers")] = (
-                            json.dumps(cpu_registers)
-                        )
-
+                        context.config[
+                            path_join(config_path, arm.AArch64RegMap.TCR_EL1.__name__)
+                        ] = tcr_el1
+                        context.config[
+                            path_join(config_path, arm.AArch64RegMap.TTBR1_EL1.__name__)
+                        ] = ttbr1_el1
                         context.config[path_join(config_path, "entry_format")] = "<Q"
 
                         layer = test.layer_type(
