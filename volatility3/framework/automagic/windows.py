@@ -174,15 +174,17 @@ class DtbSelfRef64bitAArch64(DtbSelfReferential):
     def __init__(self) -> None:
         """
         Pointers inside the DTB page are masked out with upper descriptor bits,
-        hence requiring a careful masking to extract the address.
-        Observation confirms it, code justification might be in HalpCommitTiledPageTableWorker().
-        HalpInterruptBuildGlobalStartupStub() kernel function allocates 0x28 bytes for the DTB.
+        thus requiring a careful masking to extract the address.
+
+        Relevant kernel functions :
+         - HalpCommitTiledPageTableWorker()
+         - HalpInterruptBuildGlobalStartupStub() : allocates 0x28 bytes for the DTB
         """
         super().__init__(
             layer_type=arm.WindowsAArch64,
             ptr_struct="Q",
-            # Basically 0xfffffff000
-            mask=(1 << 0x28) - 1 ^ arm.WindowsAArch64.page_mask,
+            # (1 << (64 - 17)) - 1 ^ (arm.WindowsAArch64.page_size - 1)
+            mask=0x7FFFFFFFF000,
             valid_range=range(0x100, 0x1FF),
             reserved_bits=0x0,
         )
@@ -329,9 +331,11 @@ class WindowsStacker(interfaces.automagic.StackerLayerInterface):
                     pointer = struct.unpack(
                         test.ptr_struct, page_table[index : index + ptr_size]
                     )[0]
-                    # Mask out unnecessary (upper) bits, as done in DtbSelfReferential
-                    # FIXME: prefer test.layer_type.page_mask, but attribute seems broken in Intel layer ("~" ?)
-                    pointer &= test.mask ^ (test.layer_type.page_size - 1)
+                    # Mask out descriptor/upper bits for AArch64 pointers.
+                    # Avoid applying it to Intel layers to prevent
+                    # unexpected side effects.
+                    if issubclass(test.layer_type, arm.AArch64):
+                        pointer &= test.mask | (test.layer_type.page_size - 1)
                     # Make sure the pointer is valid, ignore large pages which would require more calculation
                     # FIXME: Find documentation for 0x80, and check AArch64 validity for this value
                     if pointer & 0x1 and not pointer & 0x80:
